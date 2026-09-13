@@ -6,6 +6,7 @@ Hỗ trợ Native Tool Calling và chuyển đổi linh hoạt qua biến môi t
 import os
 import sys
 import json
+import time
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 
@@ -25,6 +26,12 @@ class BaseLLMProvider:
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
         raise NotImplementedError
 
+    def _mock_fallback(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
+        """Fallback về Mock nhưng đánh dấu rõ trong trace để không nhầm với phản hồi LLM thật"""
+        result = MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+        result["model"] = f"Offline-Mock-Fallback (thay cho {self.model_name})"
+        return result
+
 
 class MockOfflineProvider(BaseLLMProvider):
     """Offline Mock Provider dùng để chạy thử mà không tốn API Key"""
@@ -35,8 +42,31 @@ class MockOfflineProvider(BaseLLMProvider):
         return f"[Mock Chatbot Response]: Xin chào! Tôi đã nhận được câu hỏi '{prompt}'. (Chế độ Chatbot không có Tool tra cứu dữ liệu thời gian thực)."
 
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
+        # Nếu prompt đã chứa Observation từ bước trước -> mô phỏng tổng hợp Final Answer
+        if "Observation =" in prompt:
+            last_obs_line = [line for line in prompt.splitlines() if "Observation =" in line][-1]
+            try:
+                obs = json.loads(last_obs_line.split("Observation =", 1)[1].strip())
+            except json.JSONDecodeError:
+                obs = {}
+            if obs.get("status") == "SUCCESS" and "data" in obs:
+                d = obs["data"]
+                content = (
+                    f"[Mock Agent Response]: Sinh viên {obs.get('student_id', '')} ({d.get('full_name', '')}) - "
+                    f"Lớp {d.get('class', '')}, GPA: {d.get('gpa', '')}, Email: {d.get('email', '')}, "
+                    f"Trạng thái: {d.get('status', '')}, Cố vấn: {d.get('advisor', '')}."
+                )
+            else:
+                content = f"[Mock Agent Response]: {obs.get('message', json.dumps(obs, ensure_ascii=False))}"
+            return {
+                "type": "text",
+                "content": content,
+                "thought": "Đã có Observation từ MCP Server, tổng hợp câu trả lời cuối cùng.",
+                "model": self.model_name
+            }
+
         prompt_lower = prompt.lower()
-        
+
         # Mô phỏng nhận diện intent gọi Tool
         if "sv2026001" in prompt_lower and "đặt lịch" in prompt_lower:
             return {
@@ -81,7 +111,7 @@ class GeminiProvider(BaseLLMProvider):
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
             print("ℹ️ [Gemini Provider]: Chưa tìm thấy GEMINI_API_KEY hợp lệ. Tự động chuyển sang Mock Offline.")
-            return MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+            return self._mock_fallback(prompt, tools_schema, system_prompt)
         
         try:
             from google import genai
@@ -104,35 +134,60 @@ class GeminiProvider(BaseLLMProvider):
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt if system_prompt else None,
                 tools=[{"function_declarations": function_declarations}] if function_declarations else None,
-                temperature=0.2
+                temperature=0.2,
+                # Tắt Automatic Function Calling của SDK: ReAct Loop trong app.py tự điều phối Tool qua MCP Server
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             )
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config
-            )
+            # Retry có backoff khi gặp lỗi tạm thời (429 rate limit / 503 quá tải) của Gemini Free Tier
+            max_retries = 4
+            for attempt in range(max_retries + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                        config=config
+                    )
+                    break
+                except Exception as api_error:
+                    err_text = str(api_error)
+                    is_transient = any(code in err_text for code in ["429", "500", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "disconnected", "timed out", "Connection"])
+                    # Hết quota theo ngày (PerDay) thì retry cũng vô ích -> báo lỗi ngay
+                    if "PerDay" in err_text or not is_transient or attempt == max_retries:
+                        raise
+                    wait_seconds = 5 * (2 ** attempt)
+                    print(f"⏳ [Gemini Retry]: Lỗi tạm thời ({err_text[:80]}...). Thử lại sau {wait_seconds}s (lần {attempt + 1}/{max_retries}).")
+                    time.sleep(wait_seconds)
+
+            # Gom phần text Gemini sinh kèm (nếu có) để làm Thought
+            text_parts = []
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                text_parts = [p.text for p in response.candidates[0].content.parts if getattr(p, "text", None) and not getattr(p, "thought", False)]
+            model_text = "\n".join(text_parts).strip()
 
             # Kiểm tra xem Gemini có trả về Tool Call không
             if response.function_calls:
                 call = response.function_calls[0]
                 args = dict(call.args) if hasattr(call, 'args') and call.args else {}
+                auto_thought = f"Gemini quyết định gọi công cụ '{call.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
                 return {
                     "type": "tool_call",
                     "tool_name": call.name,
                     "arguments": args,
-                    "thought": f"Gemini quyết định gọi công cụ '{call.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
+                    "thought": f"{model_text} | {auto_thought}" if model_text else auto_thought,
+                    "model": self.model_name
                 }
             else:
                 return {
                     "type": "text",
-                    "content": response.text or "",
-                    "thought": "Gemini phản hồi trực tiếp bằng văn bản (không cần gọi công cụ)."
+                    "content": model_text,
+                    "thought": "Gemini phản hồi trực tiếp bằng văn bản (không cần gọi công cụ).",
+                    "model": self.model_name
                 }
 
         except Exception as e:
             print(f"⚠️ [Gemini API Warning]: Không thể kết nối live API ({str(e)}). Tự động fallback về Mock.")
-            return MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+            return self._mock_fallback(prompt, tools_schema, system_prompt)
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -159,7 +214,7 @@ class OpenAIProvider(BaseLLMProvider):
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
         if not self.api_key or self.api_key == "your_openai_api_key_here":
             print("ℹ️ [OpenAI Provider]: Chưa tìm thấy OPENAI_API_KEY hợp lệ. Tự động chuyển sang Mock Offline.")
-            return MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+            return self._mock_fallback(prompt, tools_schema, system_prompt)
 
         try:
             from openai import OpenAI
@@ -198,17 +253,19 @@ class OpenAIProvider(BaseLLMProvider):
                     "type": "tool_call",
                     "tool_name": call.function.name,
                     "arguments": args,
-                    "thought": f"OpenAI quyết định gọi công cụ '{call.function.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
+                    "thought": f"OpenAI quyết định gọi công cụ '{call.function.name}' với tham số: {json.dumps(args, ensure_ascii=False)}",
+                    "model": self.model_name
                 }
             else:
                 return {
                     "type": "text",
                     "content": msg.content or "",
-                    "thought": "OpenAI phản hồi trực tiếp bằng văn bản (không cần gọi công cụ)."
+                    "thought": "OpenAI phản hồi trực tiếp bằng văn bản (không cần gọi công cụ).",
+                    "model": self.model_name
                 }
         except Exception as e:
             print(f"⚠️ [OpenAI API Warning]: Không thể kết nối live API ({str(e)}). Tự động fallback về Mock.")
-            return MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+            return self._mock_fallback(prompt, tools_schema, system_prompt)
 
 
 def get_llm_provider() -> BaseLLMProvider:
